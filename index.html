@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Alpha Flipbook</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;
+    background:#0d0d10;color:#8a8a95;
+    font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px}
+  #book{position:relative;touch-action:none;cursor:grab}
+  #book:active{cursor:grabbing}
+
+  /* No parent perspective, no preserve-3d. Each leaf owns its perspective
+     inside its transform, so the parent stays a flat stacking context and
+     z-index between leaves is deterministic. */
+  .leaf{
+    position:absolute;top:0;left:50%;width:50%;height:100%;
+    transform-origin:left center;
+    transform:perspective(2200px) rotateY(0deg);
+    transition:transform .7s cubic-bezier(.2,.7,.3,1);
+  }
+  .leaf.flipped{transform:perspective(2200px) rotateY(-180deg)}
+  .leaf.dragging{transition:none}
+
+  .leaf img{
+    position:absolute;inset:0;width:100%;height:100%;
+    object-fit:contain;display:block;
+    pointer-events:none;-webkit-user-drag:none;
+  }
+  .leaf .img-back{display:none}
+  .leaf.flipped .img-front,
+  .leaf.show-back .img-front{display:none}
+  .leaf.flipped .img-back,
+  .leaf.show-back .img-back{display:block;transform:scaleX(-1)}
+
+  #hud{position:fixed;left:0;right:0;bottom:calc(12px + env(safe-area-inset-bottom));
+    text-align:center;letter-spacing:.12em;font-variant-numeric:tabular-nums;
+    pointer-events:none;font-size:12px}
+  #msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    padding:24px;text-align:center;white-space:pre-line;line-height:1.7}
+</style>
+</head>
+<body>
+<div id="stage"><div id="book"></div></div>
+<div id="hud"></div>
+<div id="msg">Loading…</div>
+<script>
+(() => {
+  const PAGE_DIR = 'pages/', EXT = '.png', MAX = 500;
+  const bookEl = document.getElementById('book');
+  const hudEl  = document.getElementById('hud');
+  const msgEl  = document.getElementById('msg');
+
+  let leaves = [], totalFaces = 0, pageW = 0, pageH = 0;
+  let idx = 0, busy = false, gesture = null;
+
+  const exists = url => new Promise(r => {
+    const i = new Image(); i.onload = () => r(true); i.onerror = () => r(false); i.src = url;
+  });
+  const loadImg = url => new Promise((res, rej) => {
+    const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url;
+  });
+
+  (async () => {
+    const urls = [];
+    for (let n = 1; n <= MAX; n++) {
+      const u = PAGE_DIR + n + EXT;
+      if (!(await exists(u))) break;
+      urls.push(u);
+    }
+    if (!urls.length) {
+      msgEl.textContent = 'No pages found.\n\nCreate a folder named "pages" next to this file and add 1.png, 2.png, 3.png … (PNG, same dimensions, alpha OK).';
+      return;
+    }
+
+    const imgs = await Promise.all(urls.map(loadImg));
+    pageW = imgs[0].naturalWidth; pageH = imgs[0].naturalHeight;
+    totalFaces = imgs.length;
+
+    const leafCount = Math.ceil(imgs.length / 2);
+    for (let i = 0; i < leafCount; i++) {
+      const leaf = document.createElement('div');
+      leaf.className = 'leaf';
+
+      imgs[2 * i].className = 'img-front';
+      leaf.appendChild(imgs[2 * i]);
+
+      if (imgs[2 * i + 1]) {
+        imgs[2 * i + 1].className = 'img-back';
+        leaf.appendChild(imgs[2 * i + 1]);
+      }
+
+      bookEl.appendChild(leaf);
+      leaves.push(leaf);
+    }
+
+    layout();
+    restack();
+    addEventListener('resize', layout);
+    addEventListener('orientationchange', () => setTimeout(layout, 150));
+    msgEl.remove();
+    updateHud();
+  })();
+
+  function layout() {
+    if (!pageW) return;
+    const pad = 16;
+    const aw = Math.max(160, innerWidth - pad * 2);
+    const ah = Math.max(160, innerHeight - pad * 2);
+    const s = Math.min(aw / (pageW * 2), ah / pageH);
+    bookEl.style.width  = Math.round(pageW * 2 * s) + 'px';
+    bookEl.style.height = Math.round(pageH * s) + 'px';
+  }
+
+  // Left (flipped):    later index on top  → higher z  (page 4 over page 2)
+  // Right (unflipped): earlier index on top → higher z  (page 1 over page 3 over page 5)
+  function restack() {
+    leaves.forEach((leaf, i) => {
+      const flipped = leaf.classList.contains('flipped');
+      leaf.style.zIndex = flipped ? String(10 + i) : String(1000 - i);
+    });
+  }
+
+  function updateHud() {
+    const left  = idx > 0 ? 2 * idx : null;
+    const right = 2 * idx + 1 <= totalFaces ? 2 * idx + 1 : null;
+    if (left && right)  hudEl.textContent = `PAGES ${left} – ${right} / ${totalFaces}`;
+    else if (right)     hudEl.textContent = `PAGE ${right} / ${totalFaces}`;
+    else if (left)      hudEl.textContent = `PAGE ${left} / ${totalFaces}`;
+    else                hudEl.textContent = '';
+  }
+
+  const applyFace = (el, angle) => el.classList.toggle('show-back', angle < -90);
+
+  bookEl.addEventListener('pointerdown', e => {
+    if (busy || !leaves.length) return;
+    if (e.button !== undefined && e.button !== 0) return;
+    gesture = { x0: e.clientX, lock: 0, el: null, angle: 0 };
+    try { bookEl.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+
+  bookEl.addEventListener('pointermove', e => {
+    if (!gesture) return;
+    const dx = e.clientX - gesture.x0;
+    const leafW = (bookEl.clientWidth || 1) / 2;
+
+    if (!gesture.lock) {
+      if (Math.abs(dx) < 8) return;
+      if (dx < 0) {
+        if (idx >= leaves.length) { gesture = null; return; }
+        gesture.lock = -1;
+        gesture.el   = leaves[idx];
+        gesture.el.classList.add('dragging');
+      } else {
+        if (idx <= 0) { gesture = null; return; }
+        gesture.lock = 1;
+        gesture.el   = leaves[idx - 1];
+        gesture.el.classList.add('dragging');
+        gesture.el.classList.remove('flipped');
+        gesture.el.classList.add('show-back');
+        gesture.el.style.transform = 'perspective(2200px) rotateY(-180deg)';
+      }
+      gesture.el.style.zIndex = '9999';   // top of everything while turning
+    }
+
+    let angle;
+    if (gesture.lock === -1) angle = Math.max(-180, Math.min(0, (dx / leafW) * 180));
+    else                     angle = Math.max(-180, Math.min(0, -180 + (dx / leafW) * 180));
+
+    gesture.angle = angle;
+    gesture.el.style.transform = `perspective(2200px) rotateY(${angle}deg)`;
+    applyFace(gesture.el, angle);
+  });
+
+  function settle(leaf, target) {
+    leaf.classList.remove('dragging');
+    leaf.style.transform = '';
+    if (target === 'flipped') { leaf.classList.add('flipped'); leaf.classList.remove('show-back'); }
+    else                      { leaf.classList.remove('flipped', 'show-back'); }
+    busy = true;
+    setTimeout(() => { busy = false; restack(); }, 720);
+  }
+
+  function endGesture() {
+    if (!gesture) return;
+    const g = gesture; gesture = null;
+    if (!g.lock) return;
+
+    const el = g.el, forward = g.lock === -1;
+    const commit = forward ? g.angle < -90 : g.angle > -90;
+
+    if (forward) {
+      if (commit) { idx++; settle(el, 'flipped'); }
+      else        {        settle(el, 'flat');    }
+    } else {
+      if (commit) { idx--; settle(el, 'flat');    }
+      else        {        settle(el, 'flipped'); }
+    }
+    updateHud();
+  }
+
+  bookEl.addEventListener('pointerup', endGesture);
+  bookEl.addEventListener('pointercancel', endGesture);
+
+  addEventListener('keydown', e => {
+    if (busy || !leaves.length) return;
+    if (e.key === 'ArrowRight' || e.key === ' ') {
+      if (idx >= leaves.length) return;
+      leaves[idx].style.zIndex = '9999';
+      settle(leaves[idx], 'flipped'); idx++;
+      updateHud();
+    } else if (e.key === 'ArrowLeft') {
+      if (idx <= 0) return;
+      idx--;
+      leaves[idx].style.zIndex = '9999';
+      settle(leaves[idx], 'flat');
+      updateHud();
+    }
+  });
+})();
+</script>
+</body>
+</html>
